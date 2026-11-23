@@ -1,0 +1,243 @@
+#include <MK64F12.h>
+ 
+#define MASK(x) (1UL << (x))
+ 
+/* Global Variables */
+volatile int target_num = 5;      /* Left digit: Target number (0-9) */
+volatile int spin_num = 0;        /* Right digit: Spinning number (0-9) */
+volatile int speed_ticks = 4;     /* Spin speed: 4 = Easy (0.4s), 2 = Hard (0.2s) */
+volatile int tick_counter = 0;    /* Timer tick counter */
+volatile int debounce_timer = 0;  /* Prevents S1 switch bounce */
+ 
+/* Rhythmic Buzzer Variables */
+volatile int beep_pulses = 0;
+volatile int buzzer_state = 0;
+ 
+/* 7-Segment lookup table (Common Anode: 0 = ON, 1 = OFF) */
+const uint8_t SEGMENT_MAP[10] = {0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90};
+const uint8_t DIGIT_MAP[2]    = {0xF8, 0xF4}; /* [0]=Right (Spinner), [1]=Left (Target) */
+ 
+/* Function Prototypes */
+void delay_ms(uint32_t ms);
+void buzzer_on(void);
+void buzzer_off(void);
+void start_buzzer_rhythm(int count);
+void init_GPIO(void);
+void init_EXT_Interrupt(void);
+void init_PIT_Timer(void);
+void shift_out_595(uint8_t data);
+void update_7segment(int left, int right);
+void read_switches(void);
+ 
+void delay_ms(uint32_t ms) {
+    for (uint32_t i = 0; i < ms * 10000; i++) {
+        __NOP();
+    }
+}
+ 
+void buzzer_on(void) {
+    PORTA->PCR[1] = (PORTA->PCR[1] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PTA->PDDR |= MASK(1);
+    PTA->PCOR = MASK(1);   /* Drive LOW -> Buzzer ON */
+    buzzer_state = 1;
+}
+ 
+void buzzer_off(void) {
+    PTA->PSOR = MASK(1);
+    PTA->PDDR &= ~MASK(1); /* High-Z to cut base current cleanly */
+    PORTA->PCR[1] = (PORTA->PCR[1] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(0);
+    buzzer_state = 0;
+}
+ 
+void start_buzzer_rhythm(int count) {
+    beep_pulses = (count * 2) - 1;
+    buzzer_on();
+}
+ 
+/* =========================================================================
+* 1. Initialization Functions
+* ========================================================================= */
+ 
+void init_GPIO(void) {
+    delay_ms(1000);
+ 
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK | 
+                  SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
+ 
+    buzzer_off();
+ 
+    /* Switches: S1(PTB3 = Catch/Interrupt), S2(PTB10 = Easy), S3(PTB11 = Hard) */
+    PORTB->PCR[3]  = (PORTB->PCR[3]  & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[10] = (PORTB->PCR[10] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[11] = (PORTB->PCR[11] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PTB->PDDR &= ~(MASK(3) | MASK(10) | MASK(11));
+ 
+    /* Shield LEDs: D4(PTD0), D1(PTD1), D3(PTD2), D2(PTD3) */
+    PORTD->PCR[0] = (PORTD->PCR[0] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PORTD->PCR[1] = (PORTD->PCR[1] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PORTD->PCR[2] = (PORTD->PCR[2] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PORTD->PCR[3] = (PORTD->PCR[3] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PTD->PDDR |= (MASK(0) | MASK(1) | MASK(2) | MASK(3));
+    PTD->PSOR  = (MASK(0) | MASK(1) | MASK(2) | MASK(3)); /* All LEDs OFF */
+    PTD->PCOR  = MASK(3); /* Turn ON LED D2 initially (Easy mode) */
+ 
+    /* 7-Segment (74HC595): Latch(PTB23), Clock(PTC3), Data(PTC12) */
+    PORTB->PCR[23] = (PORTB->PCR[23] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PTB->PDDR |= MASK(23);
+ 
+    PORTC->PCR[3]  = (PORTC->PCR[3]  & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PORTC->PCR[12] = (PORTC->PCR[12] & ~PORT_PCR_MUX_MASK) | PORT_PCR_MUX(1);
+    PTC->PDDR |= (MASK(3) | MASK(12));
+}
+ 
+void init_EXT_Interrupt(void) {
+    /* Configure PTB3 (Switch S1) for Falling Edge Interrupt (0x0A) */
+    PORTB->PCR[3] |= PORT_PCR_IRQC(0x0A);
+    PORTB->ISFR = MASK(3);
+ 
+    NVIC_ClearPendingIRQ(PORTB_IRQn);
+    NVIC_EnableIRQ(PORTB_IRQn);
+}
+ 
+void init_PIT_Timer(void) {
+    SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
+    PIT->MCR = 0x00;
+ 
+    /* 0.1 second interval (at 60MHz Bus Clock) */
+    PIT->CHANNEL[0].LDVAL = 5999999;
+    PIT->CHANNEL[0].TCTRL = PIT_TCTRL_TIE_MASK | PIT_TCTRL_TEN_MASK;
+ 
+    NVIC_ClearPendingIRQ(PIT0_IRQn);
+    NVIC_EnableIRQ(PIT0_IRQn);
+}
+ 
+/* =========================================================================
+* 2. Peripheral Control Functions
+* ========================================================================= */
+ 
+void shift_out_595(uint8_t data) {
+    for (int i = 0; i < 8; i++) {
+        if (data & (1 << (7 - i))) {
+            PTC->PSOR = MASK(12);
+        } else {
+            PTC->PCOR = MASK(12);
+        }
+        PTC->PSOR = MASK(3);
+        __NOP();
+        PTC->PCOR = MASK(3);
+    }
+}
+ 
+void update_7segment(int left, int right) {
+    /* Display Spinner on Right digit */
+    PTB->PCOR = MASK(23);
+    shift_out_595(SEGMENT_MAP[right]);
+    shift_out_595(DIGIT_MAP[0]);
+    PTB->PSOR = MASK(23);
+    delay_ms(2);
+ 
+    /* Display Target on Left digit */
+    PTB->PCOR = MASK(23);
+    shift_out_595(SEGMENT_MAP[left]);
+    shift_out_595(DIGIT_MAP[1]);
+    PTB->PSOR = MASK(23);
+    delay_ms(2);
+}
+ 
+void read_switches(void) {
+    /* Press S2 (PTB10) -> Easy Mode (Slow spin: 0.4s) */
+    if ((PTB->PDIR & MASK(10)) == 0) {
+        speed_ticks = 4;
+        PTD->PSOR = MASK(2); /* LED D3 OFF */
+        PTD->PCOR = MASK(3); /* LED D2 ON */
+        while ((PTB->PDIR & MASK(10)) == 0) {
+            update_7segment(target_num, spin_num);
+        }
+        delay_ms(50);
+    }
+ 
+    /* Press S3 (PTB11) -> Hard Mode (Fast spin: 0.2s) */
+    if ((PTB->PDIR & MASK(11)) == 0) {
+        speed_ticks = 2;
+        PTD->PSOR = MASK(3); /* LED D2 OFF */
+        PTD->PCOR = MASK(2); /* LED D3 ON */
+        while ((PTB->PDIR & MASK(11)) == 0) {
+            update_7segment(target_num, spin_num);
+        }
+        delay_ms(50);
+    }
+}
+ 
+/* =========================================================================
+* 3. Interrupt Service Routines (ISR)
+* ========================================================================= */
+ 
+/* External Interrupt ISR: Press S1 (PTB3) to catch the spinning number */
+void PORTB_IRQHandler(void) {
+    if (PORTB->ISFR & MASK(3)) {
+        /* Software Debounce check: only accept press if cooldown finished */
+        if (debounce_timer == 0) {
+            debounce_timer = 3; /* Ignore bounce for 0.3 seconds */
+ 
+            if (spin_num == target_num) {
+                /* Matched! Player wins */
+                PTD->PSOR = MASK(0);        /* LED D4 OFF */
+                PTD->PCOR = MASK(1);        /* LED D1 ON (Win!) */
+                start_buzzer_rhythm(2);     /* 2 happy beeps */
+                /* Generate next target number (1-9) */
+                target_num = (target_num + 3) % 10;
+            } else {
+                /* Missed! */
+                PTD->PSOR = MASK(1);        /* LED D1 OFF */
+                PTD->PCOR = MASK(0);        /* LED D4 ON (Miss!) */
+                start_buzzer_rhythm(1);     /* 1 miss beep */
+            }
+        }
+        PORTB->ISFR = MASK(3); /* Clear External Interrupt Flag */
+    }
+}
+ 
+/* PIT0 Timer Interrupt ISR: Runs every 0.1 seconds */
+void PIT0_IRQHandler(void) {
+    tick_counter++;
+ 
+    /* Decrement debounce cooldown timer */
+    if (debounce_timer > 0) {
+        debounce_timer--;
+    }
+ 
+    /* Handle Rhythmic Buzzer Pulses */
+    if (beep_pulses > 0) {
+        beep_pulses--;
+        if (buzzer_state == 1) {
+            buzzer_off();
+        } else {
+            buzzer_on();
+        }
+    } else if (buzzer_state == 1) {
+        buzzer_off();
+    }
+ 
+    /* Spin the right digit according to selected speed */
+    if (tick_counter >= speed_ticks) {
+        tick_counter = 0;
+        spin_num = (spin_num + 1) % 10;
+    }
+ 
+    PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
+}
+ 
+/* =========================================================================
+* 4. Main Function
+* ========================================================================= */
+ 
+int main(void) {
+    init_GPIO();
+    init_EXT_Interrupt();
+    init_PIT_Timer();
+ 
+    while (1) {
+        read_switches();
+        update_7segment(target_num, spin_num);
+    }
+}
